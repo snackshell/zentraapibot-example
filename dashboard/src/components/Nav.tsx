@@ -8,6 +8,7 @@ const LINKS = [
   { href: "/orders", label: "Orders" },
   { href: "/customers", label: "Customers" },
   { href: "/deposits", label: "Deposits" },
+  { href: "/local-payments", label: "Local Payments" },
   { href: "/credit", label: "Credit by hand" },
   { href: "/settings", label: "Settings" },
 ];

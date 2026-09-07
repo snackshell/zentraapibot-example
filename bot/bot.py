@@ -1,17 +1,15 @@
 """The Telegram bot. Phase 1 added catalogue, wallet balance, and buying.
 Phase 2 added automatic USDT (BEP-20) top-ups, watched on-chain. Phase 3
-adds automatic Binance Pay top-ups, read from the operator's own account.
-
-TELEBIRR AND BANK OF ABYSSINIA ARE NOT WIRED UP YET — Phase 5. Until then,
-an admin credits a customer by hand from the dashboard's Credit by hand
-page, which is also the fallback every rail keeps forever, exactly as
-ZentraShopBot does, because a payment that does not match anything
-automatic should never mean a customer simply loses their money.
+added automatic Binance Pay top-ups, read from the operator's own account.
+Phase 5 adds Telebirr and Bank of Abyssinia — manual by default, automatic
+when LocalPaymentVerify is configured.
 
 WHERE THE MONEY ACTUALLY MOVES: purchase() below for spending; db.py's
-credit_deposit() for every top-up rail, called from UsdtWatcher and
-BinancePaySweeper alike — nowhere else. Every button that can end in a
-charge calls one of exactly these paths.
+credit_deposit() for every top-up rail — called from UsdtWatcher and
+BinancePaySweeper on their own timers, and from topup_local_reference()
+below the moment a Telebirr/Abyssinia receipt verifies, or from the
+dashboard's Local Payments page when an admin credits one by hand. Every
+button that can end in a charge calls one of exactly these paths.
 """
 
 from __future__ import annotations
@@ -37,7 +35,11 @@ from .binance_pay import BinancePayClient, BinancePaySweeper
 from .chain import BscRpc, UsdtWatcher
 from .config import Config
 from .db import Db
-from .money import fmt_usdt
+from .localpay import Refused, check as check_local_receipt
+from .localverify import ABYSSINIA, TELEBIRR, Verifier as LocalVerifier
+from .localverify import VerifierError, detect as detect_local_reference
+from .localverify import normalise as normalise_local_reference
+from .money import fmt_etb, fmt_usdt, to_etb, to_usdt
 from .pricing import sell_price
 from .settings import Settings
 from .zentra_api import ZentraClient, ZentraError
@@ -51,6 +53,12 @@ db = Db(cfg.database_url)
 live = Settings(db)
 zentra = ZentraClient(cfg.zentra_api_key, base_url=cfg.zentra_api_base_url)
 
+# One client for LocalPaymentVerify, kept open across requests — cheap to
+# construct even when LOCAL_VERIFY_URL is blank, since Verifier only opens
+# an actual connection lazily and .configured says outright whether it can
+# be used at all.
+local_verifier = LocalVerifier(cfg.local_verify_url, cfg.local_verify_api_key)
+
 bot = Bot(token=cfg.bot_token)
 dp = Dispatcher()
 
@@ -63,6 +71,12 @@ _binance_client: BinancePayClient | None = None
 class TopUp(StatesGroup):
     usdt_amount = State()
     binance_amount = State()
+    telebirr_amount = State()
+    abyssinia_amount = State()
+    # One state for both rails: which deposit and provider it belongs to
+    # travels in the FSM's own data (set_data), not in a second state per
+    # rail — the message a customer sends back looks the same either way.
+    local_reference = State()
 
 
 def button(text: str, callback_data: str) -> InlineKeyboardButton:
@@ -284,6 +298,31 @@ def binance_rail_live() -> bool:
     return bool(live.get("binance_pay_enabled", False)) and cfg.binance_pay_enabled
 
 
+def telebirr_rail_live() -> bool:
+    """Same shape again: the dashboard switch AND a receiving number
+    configured in .env — see cfg.telebirr_configured. Automatic
+    verification is a THIRD, independent thing (telebirr_verify_live()
+    below); a rail with verification off still works, manually."""
+    return bool(live.get("telebirr_enabled", False)) and cfg.telebirr_configured
+
+
+def abyssinia_rail_live() -> bool:
+    return bool(live.get("abyssinia_enabled", False)) and cfg.abyssinia_configured
+
+
+def telebirr_verify_live() -> bool:
+    """Whether a submitted Telebirr reference gets checked automatically,
+    as opposed to simply waiting for an admin. Needs the dashboard's own
+    switch AND a working LocalPaymentVerify instance — a provider outage
+    should fall back to manual review without an admin having to notice
+    and flip anything."""
+    return bool(live.get("telebirr_verify_enabled", False)) and local_verifier.configured
+
+
+def abyssinia_verify_live() -> bool:
+    return bool(live.get("abyssinia_verify_enabled", False)) and local_verifier.configured
+
+
 @dp.callback_query(F.data == "wallet")
 async def wallet(call: CallbackQuery) -> None:
     user = await db.ensure_user(call.from_user.id, call.from_user.username)
@@ -293,10 +332,16 @@ async def wallet(call: CallbackQuery) -> None:
         rows.append([button("➕ Top up with USDT (BEP-20)", "topup_usdt")])
     if binance_rail_live():
         rows.append([button("➕ Top up with Binance Pay", "topup_binance")])
+    if telebirr_rail_live():
+        rows.append([button("➕ Top up with Telebirr", "topup_telebirr")])
+    if abyssinia_rail_live():
+        rows.append([button("➕ Top up with Bank of Abyssinia", "topup_abyssinia")])
     rows.append([button("« Menu", "home")])
 
+    any_rail = (usdt_rail_live() or binance_rail_live()
+                or telebirr_rail_live() or abyssinia_rail_live())
     text = f"💳 <b>Your wallet</b>\n\nBalance: <b>{fmt_usdt(balance)}</b>"
-    if not usdt_rail_live() and not binance_rail_live():
+    if not any_rail:
         text += ("\n\nTo top up, contact support — automatic top-ups "
                  "are not turned on yet.")
 
@@ -433,6 +478,207 @@ async def topup_binance_amount(message: Message, state: FSMContext) -> None:
     )
 
 
+# ---- Telebirr / Bank of Abyssinia (Phase 5) --------------------------------
+#
+# UNLIKE USDT AND BINANCE PAY, THIS RAIL DOES NOT MATCH BY AMOUNT — see
+# localpay.py's header for why. So there is no allocator step: the request
+# is opened for whatever the customer says they intend to send, and what
+# actually settles it is the RECEIPT REFERENCE they type back afterwards.
+
+_LOCAL_RAIL = {"telebirr": (TELEBIRR, "Telebirr"), "abyssinia": (ABYSSINIA, "Bank of Abyssinia")}
+
+
+async def _start_local_topup(message_or_call, state: FSMContext, method: str) -> None:
+    label = _LOCAL_RAIL[method][1]
+    target_state = TopUp.telebirr_amount if method == "telebirr" else TopUp.abyssinia_amount
+    await state.set_state(target_state)
+    minimum_usd = live.decimal("min_topup_usd", "1")
+    rate = live.decimal("usdt_to_etb", "160")
+    minimum_etb = to_etb(minimum_usd, rate)
+    text = (
+        f"➕ <b>Top up with {label}</b>\n\n"
+        f"How much do you want to send, in birr? Send a number — minimum "
+        f"{fmt_etb(minimum_etb)}."
+    )
+    markup = InlineKeyboardMarkup(inline_keyboard=[[button("« Cancel", "wallet")]])
+    if isinstance(message_or_call, CallbackQuery):
+        await message_or_call.message.edit_text(text, reply_markup=markup)
+        await message_or_call.answer()
+    else:
+        await message_or_call.answer(text, reply_markup=markup)
+
+
+@dp.callback_query(F.data == "topup_telebirr")
+async def topup_telebirr_start(call: CallbackQuery, state: FSMContext) -> None:
+    if not telebirr_rail_live():
+        await call.answer("Telebirr top-ups are not turned on.", show_alert=True)
+        return
+    await _start_local_topup(call, state, "telebirr")
+
+
+@dp.callback_query(F.data == "topup_abyssinia")
+async def topup_abyssinia_start(call: CallbackQuery, state: FSMContext) -> None:
+    if not abyssinia_rail_live():
+        await call.answer("Bank of Abyssinia top-ups are not turned on.", show_alert=True)
+        return
+    await _start_local_topup(call, state, "abyssinia")
+
+
+async def _local_topup_amount(message: Message, state: FSMContext, method: str) -> None:
+    raw = (message.text or "").strip().replace(",", "")
+    try:
+        amount_etb = Decimal(raw)
+    except (InvalidOperation, ValueError):
+        await message.answer("That doesn't look like a number. Try again, or /start to cancel.")
+        return
+    if amount_etb <= 0:
+        await message.answer("Send an amount greater than zero, or /start to cancel.")
+        return
+
+    rate = live.decimal("usdt_to_etb", "160")
+    minimum_etb = to_etb(live.decimal("min_topup_usd", "1"), rate)
+    if amount_etb < minimum_etb:
+        await message.answer(
+            f"The smallest top-up is {fmt_etb(minimum_etb)}. Send a larger "
+            f"amount, or /start to cancel."
+        )
+        return
+
+    user = await db.ensure_user(message.from_user.id, message.from_user.username)
+    deposit = await db.open_local_deposit(
+        user_id=user["id"], method=method, amount_etb=amount_etb,
+        window_minutes=int(live.get("deposit_window_minutes", 60)),
+    )
+    await state.set_state(TopUp.local_reference)
+    await state.update_data(deposit_id=deposit["id"], method=method)
+
+    label = _LOCAL_RAIL[method][1]
+    if method == "telebirr":
+        where = (f"Telebirr\n<code>{html.escape(cfg.telebirr_number)}</code>"
+                 + (f"\nName: <b>{html.escape(cfg.telebirr_name)}</b>" if cfg.telebirr_name else ""))
+        ask = "reply with the 10-character reference number from your receipt"
+    else:
+        where = (f"Bank of Abyssinia\n<code>{html.escape(cfg.abyssinia_account)}</code>"
+                 + (f"\nName: <b>{html.escape(cfg.abyssinia_name)}</b>" if cfg.abyssinia_name else ""))
+        ask = ("reply with the reference (starts with FT) and the last 5 "
+               "digits of the account you paid from, separated by a space — "
+               "for example <code>FT24AB12CD34 56789</code>")
+
+    minutes = int(live.get("deposit_window_minutes", 60))
+    await message.answer(
+        f"💳 <b>Send {fmt_etb(amount_etb)} via {label}</b>\n\n"
+        f"To:\n{where}\n\n"
+        f"Once you've paid, {ask}.\n\n"
+        f"<i>This request stays open for {minutes} minutes, but a receipt "
+        f"can still be submitted after that — it just will not match "
+        f"whoever asks for the same figure next.</i>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[button("« Menu", "home")]]),
+    )
+
+
+@dp.message(TopUp.telebirr_amount)
+async def topup_telebirr_amount(message: Message, state: FSMContext) -> None:
+    await _local_topup_amount(message, state, "telebirr")
+
+
+@dp.message(TopUp.abyssinia_amount)
+async def topup_abyssinia_amount(message: Message, state: FSMContext) -> None:
+    await _local_topup_amount(message, state, "abyssinia")
+
+
+@dp.message(TopUp.local_reference)
+async def topup_local_reference(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    deposit_id = data.get("deposit_id")
+    method = data.get("method")
+    deposit = await db.deposit_by_id(deposit_id) if deposit_id else None
+    if deposit is None or method not in _LOCAL_RAIL:
+        await state.clear()
+        await message.answer("That request is no longer open. Start a new top-up from /start.")
+        return
+
+    parts = (message.text or "").split()
+    reference = parts[0].strip() if parts else ""
+    suffix = parts[1].strip() if len(parts) > 1 else None
+    expected_provider = _LOCAL_RAIL[method][0]
+
+    if detect_local_reference(reference) != expected_provider:
+        label = _LOCAL_RAIL[method][1]
+        await message.answer(
+            f"That doesn't look like a {label} reference. Copy it again "
+            f"from your receipt, or /start to cancel."
+        )
+        return
+    if expected_provider == ABYSSINIA and not suffix:
+        await message.answer(
+            "Also send the last 5 digits of the account you paid from, "
+            "after the reference — for example <code>FT24AB12CD34 56789</code>."
+        )
+        return
+
+    reference = normalise_local_reference(reference)
+    updated = await db.submit_local_reference(deposit_id, reference=reference, suffix=suffix)
+    if updated is None:
+        await state.clear()
+        await message.answer(
+            "That request is no longer open — it may already have been "
+            "settled or reviewed. Start a new top-up from /start if you "
+            "still need one, or contact support with your receipt."
+        )
+        return
+
+    await state.clear()
+    verify_live = telebirr_verify_live() if method == "telebirr" else abyssinia_verify_live()
+    if not verify_live:
+        await message.answer(
+            "✅ <b>Received.</b> A person will check your receipt and credit "
+            "your wallet shortly — you do not need to send anything else."
+        )
+        return
+
+    try:
+        answer = await local_verifier.verify(reference, suffix)
+        receipt = check_local_receipt(reference, answer, updated, cfg)
+    except Refused as exc:
+        log.info("Local payment %s refused automatic credit: %s", reference, exc)
+        if exc.operator:
+            # A misconfiguration, not a payment problem — the specific
+            # reason is for the deployment's own logs, not the customer.
+            text = ("✅ <b>Received.</b> A person will check your receipt "
+                    "and credit your wallet shortly.")
+        else:
+            text = (f"✅ <b>Received.</b> {exc}\n\nYour receipt has still "
+                    "been saved — a person will check it and credit your "
+                    "wallet if it settles this request.")
+        await message.answer(text)
+        return
+    except VerifierError as exc:
+        log.warning("Local payment verifier unavailable for %s: %s", reference, exc)
+        await message.answer(
+            "✅ <b>Received.</b> Automatic checking is unavailable right "
+            "now — a person will check your receipt and credit your "
+            "wallet shortly."
+        )
+        return
+
+    rate = live.decimal("usdt_to_etb", "160")
+    amount_usd = to_usdt(receipt.credit, rate)
+    credited = await db.credit_deposit(updated["id"], tx_hash=reference, amount_credited=amount_usd)
+    if credited is None:
+        await message.answer(
+            "That reference has already been used to credit a wallet. If "
+            "this is a mistake, contact support with your receipt."
+        )
+        return
+
+    await message.answer(
+        f"✅ <b>Top-up received!</b>\n\n"
+        f"+{fmt_usdt(amount_usd)} added to your wallet "
+        f"({fmt_etb(receipt.credit)} received).",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[button("« Menu", "home")]]),
+    )
+
+
 @dp.callback_query(F.data == "orders")
 async def orders(call: CallbackQuery) -> None:
     user = await db.ensure_user(call.from_user.id, call.from_user.username)
@@ -530,6 +776,19 @@ async def main() -> None:
         log.info("Binance Pay sweeper not started — BINANCE_UID/BINANCE_API_KEY/"
                  "BINANCE_API_SECRET not fully configured in .env.")
 
+    # Telebirr and Abyssinia have no background task of their own — a
+    # reference is verified on demand, the moment a customer submits one —
+    # so there is nothing to start here beyond logging what will happen
+    # when they do.
+    if local_verifier.configured:
+        log.info("LocalPaymentVerify configured at %s — Telebirr/Abyssinia "
+                 "receipts verify automatically when their own switch is on.",
+                 cfg.local_verify_url)
+    else:
+        log.info("LOCAL_VERIFY_URL/LOCAL_VERIFY_API_KEY not set — Telebirr/"
+                 "Abyssinia top-ups, if enabled, are reviewed by hand in "
+                 "the dashboard.")
+
     try:
         await dp.start_polling(bot)
     finally:
@@ -545,6 +804,7 @@ async def main() -> None:
             sweeper_task.cancel()
         if _binance_client is not None:
             await _binance_client.aclose()
+        await local_verifier.aclose()
         await zentra.aclose()
         await db.close()
 

@@ -9,6 +9,8 @@ export const maxDuration = 30; // keep in sync with lib/retry.ts MAX_DURATION
 const METHOD_LABEL: Record<string, string> = {
   usdt: "USDT (BEP-20)",
   binancepay: "Binance Pay",
+  telebirr: "Telebirr",
+  abyssinia: "Bank of Abyssinia",
 };
 
 export default async function DepositsPage({
@@ -37,6 +39,8 @@ export default async function DepositsPage({
               <option value="">Every rail</option>
               <option value="usdt">USDT (BEP-20)</option>
               <option value="binancepay">Binance Pay</option>
+              <option value="telebirr">Telebirr</option>
+              <option value="abyssinia">Bank of Abyssinia</option>
             </select>
             <button type="submit">Search</button>
           </form>
@@ -70,7 +74,11 @@ export default async function DepositsPage({
                     </td>
                     <td><span className={`pill pill-${row.status}`}>{row.status}</span></td>
                     <td className="mono">
-                      {row.tx_hash ? `${row.tx_hash.slice(0, 10)}…${row.tx_hash.slice(-6)}` : "—"}
+                      {row.tx_hash
+                        ? `${row.tx_hash.slice(0, 10)}…${row.tx_hash.slice(-6)}`
+                        : row.reference
+                          ? <span title="Submitted, not yet resolved — see Local Payments">{row.reference}</span>
+                          : "—"}
                     </td>
                     <td className="mono">{new Date(row.created_at).toLocaleString()}</td>
                   </tr>

@@ -221,7 +221,7 @@ tbody tr + tr td { border-top: 1px solid var(--border); }
 }
 .pill-delivered, .pill-credited { background: var(--ok-bg); color: var(--accent); }
 .pill-pending, .pill-awaiting { background: var(--warn-bg); color: #8a6d1f; }
-.pill-unresolved, .pill-failed, .pill-expired { background: var(--danger-bg); color: var(--danger); }
+.pill-unresolved, .pill-failed, .pill-expired, .pill-rejected { background: var(--danger-bg); color: var(--danger); }
 .pill-refunded { background: var(--surface-2); color: var(--text-dim); }
 
 input, select, button, textarea {

@@ -21,7 +21,7 @@ tested on its own — not a stub with `# TODO` where the money would go.
 | **2** | USDT (BEP-20) — automatic, watched on-chain by polling a single RPC endpoint | ✅ **done** |
 | **3** | Binance Pay — automatic, read from the operator's own account (no merchant integration) | ✅ **done** |
 | **4** | The admin dashboard — overview, settings, orders, customers, deposits, credit by hand | ✅ **done** |
-| 5 | Telebirr + Bank of Abyssinia — manual by default, automatic with LocalPaymentVerify | planned |
+| **5** | Telebirr + Bank of Abyssinia — manual by default, automatic with LocalPaymentVerify | ✅ **done** |
 
 **Right now, with just Phase 1**, the bot runs completely: customers browse
 the real Zentra catalogue at your markup, and an admin credits a balance by
@@ -137,15 +137,17 @@ cp .env.example .env.local   # DATABASE_URL (session pooler) + ADMIN_PASSWORD
 npm run dev
 ```
 
-Open `http://localhost:3000`, sign in with `ADMIN_PASSWORD`. Six pages:
+Open `http://localhost:3000`, sign in with `ADMIN_PASSWORD`. Seven pages:
 **Overview** (revenue, cost, profit, balances held, at a glance), **Orders**
 and **Customers** (searchable, with the same numbers the bot itself
 computed at the time — nothing here re-derives a price after the fact),
-**Deposits** (every top-up request on either rail, and whether it was
-credited), **Credit by hand** (the fallback above, from a form instead of
-raw SQL, still guarded by the same conditional-`UPDATE` rule as every other
-balance change in this project), and **Settings** (the markup and rail
-toggles above, editable without a restart or a database console).
+**Deposits** (every top-up request on every rail, and whether it was
+credited), **Local Payments** (Phase 5's review queue for Telebirr/Abyssinia
+requests waiting on a person), **Credit by hand** (the fallback above, from
+a form instead of raw SQL, still guarded by the same conditional-`UPDATE`
+rule as every other balance change in this project), and **Settings** (the
+markup and rail toggles above, editable without a restart or a database
+console).
 
 One password, not a per-admin account system — see
 `dashboard/src/lib/session.ts` for why that is deliberate: rotating
@@ -159,6 +161,46 @@ why it connects through the session pooler like the bot does, and the
 same-guard-as-the-bot principle behind "Credit by hand" and every write
 this app makes.
 
+### Turning on Telebirr / Bank of Abyssinia — Phase 5
+
+**Manual by default.** With nothing more than a receiving account
+configured, both rails work exactly like "Credit by hand" always has: a
+customer sends a receipt reference, it waits in the dashboard's **Local
+Payments** page, and an admin credits or rejects it. Automatic
+verification is an upgrade on top of that, not a requirement to start.
+
+```bash
+psql "$DATABASE_URL" -f supabase/migrations/0005_local_payments.sql
+```
+
+1. Set `TELEBIRR_NUMBER`/`TELEBIRR_NAME` and/or `ABYSSINIA_ACCOUNT`/
+   `ABYSSINIA_NAME` in `.env`, then restart the bot. A rail with no account
+   set is not offered at all — see `bot/config.py`'s
+   `telebirr_configured`/`abyssinia_configured`.
+2. Turn the rail(s) on: flip "Telebirr top-ups" / "Bank of Abyssinia
+   top-ups" to Yes on the dashboard's Settings page, or
+   `UPDATE settings SET value = 'yes' WHERE key = 'telebirr_enabled';`
+   directly (and the same for `abyssinia_enabled`).
+3. Check `usdt_to_etb` on the Settings page is close to the real rate — it
+   is what converts a birr receipt into the USDT this wallet actually
+   holds, and only ever affects that conversion, never product pricing.
+
+**To add automatic verification**, run a
+[LocalPaymentVerify](https://github.com/snackshell/localpaymentverify)
+instance (typically on the same box, loopback-only — it holds provider
+credentials this bot never sees), set `LOCAL_VERIFY_URL` and
+`LOCAL_VERIFY_API_KEY` in `.env`, and leave `telebirr_verify_enabled` /
+`abyssinia_verify_enabled` at their shipped default (Yes) on the Settings
+page. Turn either off — or simply don't run the verifier — to keep that
+one rail on manual review while everything else stays automatic.
+
+`docs/GUIDE.md` §12 covers the full design: why this rail matches by
+*reference* rather than amount, the receiver-account check that is the
+whole difference between a real payment and a stranger's genuine receipt
+pasted into your bot, and how a submitted reference reaches exactly the
+same credit path — and the same exactly-once guarantee — as every other
+rail.
+
 ## Architecture
 
 ```
@@ -170,6 +212,10 @@ bot/
                   watcher.py polls and credits
   binance_pay.py  Phase 3: Binance Pay — reads the operator's own account,
                   no merchant integration
+  localverify.py  Phase 5: the LocalPaymentVerify client — fetches a Telebirr/
+                  Abyssinia receipt, decides nothing about it
+  localpay.py     Phase 5: every rule a fetched receipt has to pass before
+                  it becomes money — reference, receiver, amount, freshness
   settings.py     the runtime overlay: markup and rail toggles, editable without a restart
   pricing.py      your markup, applied once, in one place
   config.py       secrets and infrastructure, read once from .env
@@ -180,7 +226,8 @@ dashboard/              Phase 4: the admin dashboard — a separate Next.js app
   src/lib/              searches and writes, kept apart from pages so they test
                         against a real database with no request in sight
   src/app/              one route per page: overview, orders, customers,
-                        deposits, credit, settings, plus the login/session API
+                        deposits, local-payments, credit, settings, plus the
+                        login/session API
 docs/                   the full guide — auth, idempotency, every payment rail
 tests/                  a real PostgreSQL test suite; see "Testing" below
 ```
@@ -250,6 +297,19 @@ instead.
   id is the operator's own account.** The one time they might disagree — a
   transaction type nobody anticipated — the payment is refused rather than
   guessed at, exactly as ZentraShopBot's own matching does.
+- **Telebirr and Bank of Abyssinia identify a payment by its RECEIPT
+  REFERENCE, not its amount** — the same `tx_hash` column and the same
+  `credit_deposit()` function every other rail credits through, so
+  crediting the same reference twice, from any two callers (the bot's own
+  automatic check, an admin's manual approval, both at once), is the exact
+  no-op it already was for a duplicated on-chain event or a re-swept
+  Binance Pay transfer.
+- **A Telebirr/Abyssinia receipt is trusted only after its RECEIVER is
+  checked against the configured account** — a Telebirr receipt is a
+  public web page, and this is the entire difference between a real
+  payment and a stranger's genuine receipt for someone else pasted into
+  your bot. `tests/test_localpay.py` proves the refusal for a receipt paid
+  to any other account, however real that receipt is.
 
 ## Testing
 
@@ -272,6 +332,9 @@ python -m tests.test_watcher
 python -m tests.test_binance_sweep
 python -m tests.test_purchase
 python -m tests.test_topup_flow
+python -m tests.test_local_deposits
+python -m tests.test_localverify
+python -m tests.test_localpay
 python -m tests.test_lint
 ```
 
@@ -300,12 +363,13 @@ npm test
 own TypeScript stripping — no build step, no test framework beyond what
 Node ships) across `tests/auth.test.mjs`, `tests/retry.test.mjs`,
 `tests/settings.test.mjs`, `tests/credit.test.mjs`, `tests/customers.test.mjs`,
-`tests/orders.test.mjs` and `tests/deposits.test.mjs`. The same
-`supabase.co`/`supabase.com` refusal as the bot's own fixture applies here
-too — every test file that touches the database checks for it before doing
-anything else. `npm run typecheck` and `npm run build` both need to pass
-clean as well; a page that only "looks right" in the editor is not done
-until Next.js has actually compiled it.
+`tests/orders.test.mjs`, `tests/deposits.test.mjs` and
+`tests/localpayments.test.mjs`. The same `supabase.co`/`supabase.com`
+refusal as the bot's own fixture applies here too — every test file that
+touches the database checks for it before doing anything else. `npm run
+typecheck` and `npm run build` both need to pass clean as well; a page
+that only "looks right" in the editor is not done until Next.js has
+actually compiled it.
 
 ## License
 

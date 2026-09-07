@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from datetime import datetime, timezone
 from decimal import Decimal
 
 os.environ.setdefault("BOT_TOKEN", "123456789:AAEtestTokenForOfflineTestsOnly12345678")
@@ -23,22 +24,33 @@ os.environ["DATABASE_URL"] = test_database_url()
 
 from bot import bot as botmod  # noqa: E402
 from bot.bot import (  # noqa: E402
-    TopUp, topup_binance_amount, topup_binance_start, topup_usdt_amount,
-    topup_usdt_start, wallet,
+    TopUp, topup_abyssinia_start, topup_binance_amount, topup_binance_start,
+    topup_local_reference, topup_telebirr_amount, topup_telebirr_start,
+    topup_usdt_amount, topup_usdt_start, wallet,
 )
 
 
 class FakeState:
-    """Stands in for aiogram's FSMContext — just enough to track one state."""
+    """Stands in for aiogram's FSMContext — just enough to track one state
+    and the small bit of data the local-pay flow attaches to it (which
+    deposit and which provider a reference reply belongs to)."""
 
     def __init__(self):
         self._state = None
+        self._data: dict = {}
 
     async def set_state(self, state) -> None:
         self._state = state
 
     async def clear(self) -> None:
         self._state = None
+        self._data = {}
+
+    async def update_data(self, **kwargs) -> None:
+        self._data.update(kwargs)
+
+    async def get_data(self) -> dict:
+        return dict(self._data)
 
     @property
     def state(self):
@@ -223,6 +235,135 @@ async def main() -> None:
     ]
     assert len(binance_deposits) == 1
     ok("and the deposit is recorded under method='binancepay'")
+
+    # ---- Telebirr: off, then manual, then automatic -----------------------------
+
+    print("\nTelebirr, off by default")
+
+    call8 = FakeCall(5009)
+    await wallet(call8)
+    labels = _button_labels(call8.message.edited_markups[-1])
+    assert not any("Telebirr" in label for label in labels), labels
+    ok("with no receiving number configured, no Telebirr button appears")
+
+    call9 = FakeCall(5009)
+    await topup_telebirr_start(call9, FakeState())
+    assert call9.alerts and "not turned on" in call9.alerts[0]
+    ok("and tapping the callback directly is refused with a clear reason")
+
+    call9b = FakeCall(5009)
+    await topup_abyssinia_start(call9b, FakeState())
+    assert call9b.alerts and "not turned on" in call9b.alerts[0]
+    ok("Abyssinia refuses independently, with no account configured for it either")
+
+    print("\nTelebirr, live — manual review (no verifier configured)")
+
+    await db.write_setting("telebirr_enabled", "yes", updated_by=None)
+    await botmod.live.refresh()
+    botmod.cfg = botmod.cfg.__class__(
+        **{**botmod.cfg.__dict__, "telebirr_number": "0912345678",
+           "telebirr_name": "Zentra Reseller"})
+
+    call10 = FakeCall(5009)
+    await wallet(call10)
+    labels = _button_labels(call10.message.edited_markups[-1])
+    assert any("Telebirr" in label for label in labels), labels
+    ok("with the setting on and a number configured, the button appears")
+
+    tb_state = FakeState()
+    await topup_telebirr_start(FakeCall(5009), tb_state)
+    assert tb_state.state == TopUp.telebirr_amount
+    amount_msg = FakeMessage(5009, text="500")
+    await topup_telebirr_amount(amount_msg, tb_state)
+    assert tb_state.state == TopUp.local_reference
+    reply = amount_msg.sent[-1]
+    assert "0912345678" in reply and "500 ETB" in reply
+    ok("the amount screen shows the receiving number and the birr figure requested")
+
+    ref_msg = FakeMessage(5009, text="ABCD123456")
+    await topup_local_reference(ref_msg, tb_state)
+    assert tb_state.state is None
+    assert "Received" in ref_msg.sent[-1]
+    ok("without a verifier configured, a submitted reference is acknowledged and left for review")
+
+    tb_user = await db.user_by_telegram_id(5009)
+    pending = [d for d in await db.user_deposits(tb_user["id"]) if d["method"] == "telebirr"]
+    assert len(pending) == 1
+    assert pending[0]["status"] == "awaiting"
+    assert pending[0]["reference"] == "ABCD123456"
+    ok("and the deposit itself is exactly what the dashboard's Local Payments page shows: "
+       "awaiting, with the reference attached, nothing credited")
+
+    print("\nTelebirr, live — automatic verification")
+
+    class FakeVerifier:
+        """Stands in for localverify.Verifier — no network, one canned answer."""
+
+        def __init__(self, answer=None, error=None):
+            self.answer = answer
+            self.error = error
+            self.calls: list[tuple] = []
+
+        @property
+        def configured(self) -> bool:
+            return True
+
+        async def verify(self, reference, suffix=None):
+            self.calls.append((reference, suffix))
+            if self.error is not None:
+                raise self.error
+            return self.answer
+
+    await db.write_setting("telebirr_verify_enabled", "yes", updated_by=None)
+    await botmod.live.refresh()
+
+    matching_answer = {
+        "provider": "telebirr",
+        "data": {
+            "receiptNo": "EFGH567890",
+            "transactionStatus": "Completed",
+            "totalPaidAmount": "505.00",
+            "settledAmount": "500.00",
+            "creditedPartyName": "Zentra Reseller",
+            "creditedPartyAccountNo": "0912345678",
+            "paymentDate": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+        },
+    }
+    botmod.local_verifier = FakeVerifier(answer=matching_answer)
+
+    auto_state = FakeState()
+    await topup_telebirr_start(FakeCall(5009), auto_state)
+    await topup_telebirr_amount(FakeMessage(5009, text="500"), auto_state)
+    auto_ref_msg = FakeMessage(5009, text="EFGH567890")
+    await topup_local_reference(auto_ref_msg, auto_state)
+    assert "Top-up received" in auto_ref_msg.sent[-1]
+    ok("a genuine, matching receipt credits the wallet immediately, with no admin involved")
+
+    balance_5009 = await db.balance(tb_user["id"])
+    # 500 ETB / 160 = 3.125 USDT, rounded half-up to the cent by money.cents().
+    assert balance_5009 == Decimal("3.13"), balance_5009
+    ok("the credited figure is the receipt's own ETB amount, converted at usdt_to_etb")
+
+    print("\nTelebirr, automatic verification — a receipt paid to someone else")
+
+    botmod.local_verifier = FakeVerifier(answer={
+        "provider": "telebirr",
+        "data": {**matching_answer["data"], "receiptNo": "WRONG00001",
+                 "creditedPartyAccountNo": "0999999999", "creditedPartyName": "Someone Else"},
+    })
+    refused_state = FakeState()
+    await topup_telebirr_start(FakeCall(5009), refused_state)
+    await topup_telebirr_amount(FakeMessage(5009, text="500"), refused_state)
+    refused_msg = FakeMessage(5009, text="WRONG00001")
+    await topup_local_reference(refused_msg, refused_state)
+    assert "Received" in refused_msg.sent[-1]
+    assert "different account" in refused_msg.sent[-1]
+    ok("a receipt paid to a different account is NOT credited — it waits for a person, "
+       "and the customer is told why in the same message")
+
+    unchanged_balance = await db.balance(tb_user["id"])
+    assert unchanged_balance == balance_5009, "a refused receipt must not move the balance"
+    ok("and the wallet balance has not moved")
 
     await db.close()
     print(f"\n{len(checks)} checks passed.")

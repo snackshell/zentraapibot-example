@@ -105,6 +105,34 @@ def main() -> None:
     assert cfg.binance_api_base == "https://api.binance.com"
     ok("the API base defaults to Binance's own production host")
 
+    # ---- Telebirr / Bank of Abyssinia's enable condition -----------------------------
+
+    print("\nWhen Telebirr / Abyssinia are considered configured")
+
+    cfg = load_with()
+    assert cfg.telebirr_configured is False
+    assert cfg.abyssinia_configured is False
+    ok("with no receiving account set, neither rail is configured")
+
+    cfg = load_with(TELEBIRR_NUMBER="0912345678")
+    assert cfg.telebirr_configured is True
+    assert cfg.abyssinia_configured is False
+    ok("a receiving number alone is enough to configure Telebirr")
+
+    cfg = load_with(ABYSSINIA_ACCOUNT="1000123456789")
+    assert cfg.abyssinia_configured is True
+    assert cfg.telebirr_configured is False
+    ok("Abyssinia configures independently of Telebirr")
+
+    cfg = load_with()
+    assert cfg.local_verify_enabled is False
+    cfg = load_with(LOCAL_VERIFY_URL="http://127.0.0.1:3001")
+    assert cfg.local_verify_enabled is False
+    ok("a verifier URL with no API key is still not enabled")
+    cfg = load_with(LOCAL_VERIFY_URL="http://127.0.0.1:3001", LOCAL_VERIFY_API_KEY="key")
+    assert cfg.local_verify_enabled is True
+    ok("a URL and an API key together enable the verifier client")
+
     print(f"\n{len(checks)} checks passed.")
 
 

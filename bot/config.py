@@ -83,9 +83,19 @@ class Config:
 
     # ---- payment rails: Telebirr / Bank of Abyssinia (manual + verified) ---
     # Verified means LocalPaymentVerify confirms the receipt automatically;
-    # see docs/PAYMENTS.md. Without it these rails still work — an admin
+    # see docs/GUIDE.md §12. Without it these rails still work — an admin
     # approves each one by hand in the dashboard, which is where every
     # reseller should start.
+    #
+    # The receiving account is infrastructure, the same reasoning as
+    # BSC_PAYMENT_ADDRESS and BINANCE_UID: it is who gets paid, not a
+    # business rule, and verification compares a receipt's own receiver
+    # against exactly this value — a fork of this repository must supply
+    # its own, never inherit somebody else's from a shared default.
+    telebirr_number: str
+    telebirr_name: str
+    abyssinia_account: str
+    abyssinia_name: str
     local_verify_url: str
     local_verify_api_key: str
 
@@ -110,6 +120,18 @@ class Config:
     @property
     def local_verify_enabled(self) -> bool:
         return bool(self.local_verify_url and self.local_verify_api_key)
+
+    @property
+    def telebirr_configured(self) -> bool:
+        """Whether the deployment can offer Telebirr at all — automatic or
+        manual. Verification needs an account to compare a receipt against
+        (see localpay.py); without one, the rail is not offered rather than
+        offered against nothing."""
+        return bool(self.telebirr_number)
+
+    @property
+    def abyssinia_configured(self) -> bool:
+        return bool(self.abyssinia_account)
 
     @classmethod
     def load(cls) -> "Config":
@@ -139,6 +161,10 @@ class Config:
             binance_api_key=_str("BINANCE_API_KEY"),
             binance_api_secret=_str("BINANCE_API_SECRET"),
             binance_api_base=_str("BINANCE_API_BASE", "https://api.binance.com"),
+            telebirr_number=_str("TELEBIRR_NUMBER"),
+            telebirr_name=_str("TELEBIRR_NAME"),
+            abyssinia_account=_str("ABYSSINIA_ACCOUNT"),
+            abyssinia_name=_str("ABYSSINIA_NAME"),
             local_verify_url=_str("LOCAL_VERIFY_URL"),
             local_verify_api_key=_str("LOCAL_VERIFY_API_KEY"),
         )

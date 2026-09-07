@@ -37,3 +37,12 @@ def fmt_etb(amount: Decimal) -> str:
 
 def to_etb(usdt: Decimal, rate: Decimal) -> Decimal:
     return cents(usdt * rate)
+
+
+def to_usdt(etb: Decimal, rate: Decimal) -> Decimal:
+    """ETB → USDT, to the cent. Used to credit a Telebirr or Bank of
+    Abyssinia top-up: the customer pays birr, the wallet holds USDT, and
+    this is the one division that turns one into the other."""
+    if rate <= 0:
+        raise ValueError("usdt_to_etb must be greater than zero")
+    return cents(Decimal(etb) / rate)

@@ -377,6 +377,121 @@ inside the Next.js runtime — which is exactly why the pure logic lives in
 tests directly. See the README's "The dashboard's own tests" for the exact
 commands.
 
+## 12. Telebirr and Bank of Abyssinia — manual by default, verified by choice
+
+Both rails answer the same question every payment rail in this project
+answers — "did this specific customer's money actually arrive?" — but they
+are asked it differently from USDT and Binance Pay, and that difference
+shapes everything else in this section.
+
+**THE AMOUNT IS NOT A KEY ON THIS RAIL.** USDT and Binance Pay identify a
+payment by giving every request its own unique amount — a fingerprint the
+customer sends back. A Telebirr or Abyssinia transfer carries no field a
+bot could read that fingerprint out of. What it does carry is the
+provider's own receipt reference, and that already identifies the payment
+uniquely — so this rail matches by reference instead, and the amount is
+free to simply be whatever the customer actually sent (see `localpay.py`'s
+`Receipt.credit` for why the SETTLED figure, not the total the payer was
+charged, is what gets credited).
+
+**MANUAL BY DEFAULT, AND THAT IS NOT A LESSER MODE.** With nothing but a
+receiving account configured, a submitted reference simply waits — in
+`deposits`, with `status='awaiting'` and `reference` set — for an admin to
+resolve from the dashboard's Local Payments page. This is not a fallback
+bolted on for when something else fails; it is the whole rail, running
+exactly the way ZentraShopBot itself started before LocalPaymentVerify
+existed, and it is where every reseller using this starter should begin.
+
+**AUTOMATIC VERIFICATION IS AN UPGRADE, NOT A REQUIREMENT.**
+[LocalPaymentVerify](https://github.com/snackshell/localpaymentverify) is a
+small service you run yourself — typically on the same box's loopback —
+that holds the actual provider credentials this bot never sees. It answers
+exactly one question, "what does the provider say about this reference?",
+through `bot/localverify.py`'s `Verifier.verify()`. Every decision about
+whether that answer is enough to credit a wallet is made afterwards, in
+`bot/localpay.py`'s `check()` — the same separation of "fetch" from
+"decide" ZentraShopBot's own `verifier.py`/`localpay.py` split uses, kept
+for the same reason: a verifier that both fetches and adjudicates is a
+verifier whose bugs are indistinguishable from its policy.
+
+### The checks a fetched receipt has to pass
+
+`check()` raises `Refused` — with `support=True` when a person should
+look, `operator=True` when it is a misconfiguration rather than a payment
+problem — unless every one of these holds:
+
+- **the reference matches** what was actually asked about (the provider
+  echoes it back; a mismatch means something redirected the lookup);
+- **the provider says it completed** — pending, reversed, or a status word
+  nobody anticipated are all refused, never interpreted;
+- **the receiver is US** — the check that stops a stranger's genuine,
+  completed, correctly-formatted receipt from being pasted into your bot;
+  compared against `TELEBIRR_NUMBER`/`ABYSSINIA_ACCOUNT` in `.env`, with
+  the account name as corroboration, never a substitute;
+- **the amount is real and not absurd** — a zero or unreadable figure is
+  refused outright, and a payment more than 10x (or $5,000-equivalent
+  headroom) beyond what was requested is refused for a person to check
+  rather than credited on the assumption of a generous customer;
+- **the payment is fresh enough to belong to this request** — dated within
+  24 hours before the request opened (customers routinely pay first and
+  open the request after) and not in the future beyond a half-hour clock
+  skew allowance. Both providers print local time with no zone on it; East
+  Africa Time (+03:00, no daylight saving) is assumed when a stamp carries
+  none — see `PROVIDER_TZ`'s own comment for the reasoning.
+
+**SCOPE REDUCTION FROM ZENTRASHOPBOT'S OWN CHECK**, stated plainly the way
+every reduction in this project is: no masked-account handling. The real
+shop's relay sometimes redacts the middle of an account number and
+corroborates with the account holder's name in that case; this starter
+assumes a full, unmasked account number, which is what LocalPaymentVerify
+returns today. If that ever changes, `same_account()` refuses every
+receipt rather than accept a stranger's — the safe direction to fail in —
+and this is where to look. Also absent: reading a reference off a receipt
+photograph (`verify-image` in ZentraShopBot's own verifier). A customer
+types the ten characters instead; that is optical convenience, not a
+payment-safety requirement, the same reasoning behind `chain/rpc.py`
+polling one endpoint instead of running a failover pool.
+
+### The database side: one function, every rail
+
+Crediting a Telebirr/Abyssinia deposit reaches the exact same
+`db.credit_deposit()` every other rail already uses — with one addition:
+an optional `amount_credited` override, because unlike USDT and Binance
+Pay, this rail does not know what a request is worth until a receipt is
+actually read. `tx_hash` is reused as this rail's replay key too, not
+renamed — migration 0005's own comment on the column explains why that is
+a rename this project chooses not to make: one column, one meaning, across
+every rail, and a UNIQUE index on it is what makes crediting the same
+external event twice a no-op regardless of which of two callers — the
+bot's own automatic check, an admin's manual approval, conceivably both at
+once — gets there first. `tests/test_local_deposits.py` proves this by
+crediting the same reference against two different deposits and watching
+the second one refuse.
+
+`deposits.reference` is a separate column from `tx_hash`, set the moment a
+customer submits a receipt — well before, or entirely instead of, the
+deposit ever resolving. That is deliberately what the dashboard's Local
+Payments page reads to build its review queue: a request is reviewable the
+instant a reference exists, not only once something has already decided
+whether to credit it.
+
+### Turning it on
+
+1. `.env`: `TELEBIRR_NUMBER`/`TELEBIRR_NAME` and/or `ABYSSINIA_ACCOUNT`/
+   `ABYSSINIA_NAME` — infrastructure, the same reasoning as
+   `BSC_PAYMENT_ADDRESS` and `BINANCE_UID`. A rail with no account
+   configured is not offered.
+2. The dashboard settings `telebirr_enabled`/`abyssinia_enabled` — offers
+   the rail to customers, independent of whether verification is on.
+3. Optionally, a LocalPaymentVerify instance plus `LOCAL_VERIFY_URL`/
+   `LOCAL_VERIFY_API_KEY`, and `telebirr_verify_enabled`/
+   `abyssinia_verify_enabled` (Yes by default) — turns automatic
+   verification on for that rail specifically, so a provider outage drops
+   one rail back to manual review without hiding it or touching the other.
+4. `usdt_to_etb` — the only place ETB ever touches this shop's own
+   currency: it converts a birr receipt into the USDT the wallet holds,
+   and never affects product pricing, which stays in USDT throughout.
+
 ---
 
 *This guide is versioned with the code. If a section describes behaviour

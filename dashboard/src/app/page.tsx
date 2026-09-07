@@ -72,6 +72,14 @@ export default async function OverviewPage() {
                 <td className="mono">{usd(data.binanceCredited)}</td>
               </tr>
               <tr>
+                <td>Telebirr</td>
+                <td className="mono">{usd(data.telebirrCredited)}</td>
+              </tr>
+              <tr>
+                <td>Bank of Abyssinia</td>
+                <td className="mono">{usd(data.abyssiniaCredited)}</td>
+              </tr>
+              <tr>
                 <td><strong>All rails</strong></td>
                 <td className="mono"><strong>{usd(data.depositsCredited)}</strong></td>
               </tr>

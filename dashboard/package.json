@@ -8,7 +8,7 @@
     "start": "next start",
     "lint": "next lint",
     "typecheck": "tsc --noEmit",
-    "test": "node --test --test-concurrency=1 --experimental-strip-types tests/auth.test.mjs tests/retry.test.mjs tests/settings.test.mjs tests/credit.test.mjs tests/customers.test.mjs tests/orders.test.mjs tests/deposits.test.mjs"
+    "test": "node --test --test-concurrency=1 --experimental-strip-types tests/auth.test.mjs tests/retry.test.mjs tests/settings.test.mjs tests/credit.test.mjs tests/customers.test.mjs tests/orders.test.mjs tests/deposits.test.mjs tests/localpayments.test.mjs"
   },
   "dependencies": {
     "next": "^16.3.1",

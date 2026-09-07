@@ -331,7 +331,9 @@ class Db:
             (method, amount),
         )
 
-    async def credit_deposit(self, deposit_id: int, *, tx_hash: str) -> Row | None:
+    async def credit_deposit(
+        self, deposit_id: int, *, tx_hash: str, amount_credited: Decimal | None = None,
+    ) -> Row | None:
         """Claim a transaction hash and credit the wallet, in ONE transaction.
 
         Returns the credited deposit, or None if this call did not do the
@@ -343,18 +345,40 @@ class Db:
         A crash between crediting the deposit and crediting the wallet would
         otherwise leave a deposit marked paid with nobody actually paid —
         money lost, silently, with a log line claiming success.
+
+        `amount_credited`, when given, OVERWRITES the figure stored on the
+        deposit rather than trusting it. USDT and Binance Pay know exactly
+        what they will credit the moment the request is opened — the exact
+        amount IS the fingerprint — so they leave this as None and the
+        value set at allocation time stands. Telebirr and Bank of Abyssinia
+        do not: the reference identifies the payment, and what it turns
+        out to be worth is only known once a receipt is read (or an admin
+        reads one by hand), which can be this call's very first look at
+        that figure. `tx_hash` is reused as this rail's replay key too —
+        see migration 0005's comment on the column for why that is a
+        rename this project chooses not to make.
         """
         async with self._pool.connection() as conn:
             try:
                 async with conn.transaction():
-                    cur = await conn.execute(
-                        "UPDATE deposits SET status = 'credited', tx_hash = %s, "
-                        "credited_at = now() "
-                        "WHERE id = %s AND status IN ('awaiting', 'expired') "
-                        "  AND tx_hash IS NULL "
-                        "RETURNING *",
-                        (tx_hash, deposit_id),
-                    )
+                    if amount_credited is not None:
+                        cur = await conn.execute(
+                            "UPDATE deposits SET status = 'credited', tx_hash = %s, "
+                            "amount_credited = %s, credited_at = now() "
+                            "WHERE id = %s AND status IN ('awaiting', 'expired') "
+                            "  AND tx_hash IS NULL "
+                            "RETURNING *",
+                            (tx_hash, amount_credited, deposit_id),
+                        )
+                    else:
+                        cur = await conn.execute(
+                            "UPDATE deposits SET status = 'credited', tx_hash = %s, "
+                            "credited_at = now() "
+                            "WHERE id = %s AND status IN ('awaiting', 'expired') "
+                            "  AND tx_hash IS NULL "
+                            "RETURNING *",
+                            (tx_hash, deposit_id),
+                        )
                     deposit = await cur.fetchone()
                     if deposit is None:
                         return None
@@ -371,10 +395,11 @@ class Db:
                     )
                     return deposit
             except psycopg.errors.UniqueViolation:
-                # This tx_hash already credited a different deposit — the
-                # watcher saw the same on-chain event twice (a reconnect, an
-                # overlapping poll window) and this is the no-op that makes
-                # that safe.
+                # This tx_hash already credited a different deposit — seen
+                # twice by a watcher's overlapping poll (crypto rails), or
+                # the same receipt submitted to two different requests and
+                # both attempting to settle (local rails). Either way, this
+                # is the no-op that makes the second attempt safe.
                 log.info("tx_hash %s was already used to credit a deposit.", tx_hash)
                 return None
 
@@ -395,6 +420,59 @@ class Db:
             "SELECT * FROM deposits WHERE user_id = %s "
             "ORDER BY created_at DESC LIMIT %s",
             (user_id, limit),
+        )
+
+    # ---- Telebirr / Bank of Abyssinia deposits (Phase 5) -------------------
+    #
+    # These rails identify a payment by its REFERENCE, not its amount — see
+    # localpay.py's own header for why. So there is no allocator here: a
+    # request is just opened, and `amount_expected` is informational (what
+    # the customer said they intended to send, in ETB) rather than a
+    # fingerprint two requests could collide over. credit_deposit() above
+    # is still what actually moves money, exactly as it is for USDT and
+    # Binance Pay — only how a deposit gets THERE differs.
+
+    async def open_local_deposit(
+        self, *, user_id: int, method: str, amount_etb: Decimal, window_minutes: int,
+    ) -> Row:
+        """Open a Telebirr or Abyssinia request. `amount_credited` starts at
+        0 and is overwritten by credit_deposit()'s own override the moment
+        a real figure is known — never displayed or used before then."""
+        return await self.fetchone(
+            "INSERT INTO deposits (user_id, method, amount_expected, "
+            "amount_credited, expires_at, cooldown_until) "
+            "VALUES (%s, %s, %s, 0, now() + make_interval(mins => %s), "
+            "        now() + make_interval(mins => %s)) RETURNING *",
+            (user_id, method, amount_etb, window_minutes, window_minutes),
+        )
+
+    async def submit_local_reference(
+        self, deposit_id: int, *, reference: str, suffix: str | None = None,
+    ) -> Row | None:
+        """Attach the receipt reference a customer typed to their open
+        request, so it exists for a human to review even before — or
+        instead of — automatic verification. Returns None if the request
+        is no longer open to receive one (already credited or rejected),
+        so a stale retry cannot overwrite a resolved request's record."""
+        return await self.fetchone(
+            "UPDATE deposits SET reference = %s, suffix = %s "
+            "WHERE id = %s AND status IN ('awaiting', 'expired') AND tx_hash IS NULL "
+            "RETURNING *",
+            (reference, suffix, deposit_id),
+        )
+
+    async def reject_local_deposit(self, deposit_id: int, *, note: str) -> Row | None:
+        """An admin's clean 'no' — the counterpart to crediting by hand.
+
+        Guarded the same shape as every other resolution on this table:
+        the WHERE clause is what makes a deposit resolve exactly once,
+        whichever of credit_deposit() or this gets there first.
+        """
+        return await self.fetchone(
+            "UPDATE deposits SET status = 'rejected', note = %s "
+            "WHERE id = %s AND status IN ('awaiting', 'expired') AND tx_hash IS NULL "
+            "RETURNING *",
+            (note, deposit_id),
         )
 
     # ---- internal bookkeeping (not a business setting) ---------------------

@@ -12,6 +12,8 @@ export type Overview = {
   depositsCredited: string;
   usdtCredited: string;
   binanceCredited: string;
+  telebirrCredited: string;
+  abyssiniaCredited: string;
 };
 
 /**
@@ -31,10 +33,12 @@ export async function overview(sql: Client): Promise<Overview> {
     sql<{ customers: string; held: string }[]>`
       SELECT count(*) AS customers, coalesce(sum(balance_usd), 0) AS held FROM users
     `,
-    sql<{ total: string; usdt: string; binance: string }[]>`
-      SELECT coalesce(sum(amount_credited), 0)                                     AS total,
-             coalesce(sum(amount_credited) FILTER (WHERE method = 'usdt'), 0)       AS usdt,
-             coalesce(sum(amount_credited) FILTER (WHERE method = 'binancepay'), 0) AS binance
+    sql<{ total: string; usdt: string; binance: string; telebirr: string; abyssinia: string }[]>`
+      SELECT coalesce(sum(amount_credited), 0)                                       AS total,
+             coalesce(sum(amount_credited) FILTER (WHERE method = 'usdt'), 0)         AS usdt,
+             coalesce(sum(amount_credited) FILTER (WHERE method = 'binancepay'), 0)   AS binance,
+             coalesce(sum(amount_credited) FILTER (WHERE method = 'telebirr'), 0)     AS telebirr,
+             coalesce(sum(amount_credited) FILTER (WHERE method = 'abyssinia'), 0)    AS abyssinia
         FROM deposits WHERE status = 'credited'
     `,
   ]);
@@ -52,5 +56,7 @@ export async function overview(sql: Client): Promise<Overview> {
     depositsCredited: dep?.total ?? "0",
     usdtCredited: dep?.usdt ?? "0",
     binanceCredited: dep?.binance ?? "0",
+    telebirrCredited: dep?.telebirr ?? "0",
+    abyssiniaCredited: dep?.abyssinia ?? "0",
   };
 }
