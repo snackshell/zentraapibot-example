@@ -124,14 +124,40 @@ def main() -> None:
     assert cfg.telebirr_configured is False
     ok("Abyssinia configures independently of Telebirr")
 
+    # ---- verification needs NO configuration of its own ----------------------
+
+    print("\nVerification is hosted by default")
+
     cfg = load_with()
-    assert cfg.local_verify_enabled is False
-    cfg = load_with(LOCAL_VERIFY_URL="http://127.0.0.1:3001")
-    assert cfg.local_verify_enabled is False
-    ok("a verifier URL with no API key is still not enabled")
-    cfg = load_with(LOCAL_VERIFY_URL="http://127.0.0.1:3001", LOCAL_VERIFY_API_KEY="key")
-    assert cfg.local_verify_enabled is True
-    ok("a URL and an API key together enable the verifier client")
+    assert cfg.self_hosted_verify is False
+    ok("with nothing set, the deployment is not self-hosting — Zentra verifies")
+
+    cfg = load_with(TELEBIRR_VERIFY_URL="http://127.0.0.1:3001")
+    assert cfg.self_hosted_verify is False
+    ok("a self-host URL with no key does NOT switch modes — it would be an open endpoint")
+
+    cfg = load_with(TELEBIRR_VERIFY_URL="http://127.0.0.1:3001",
+                    TELEBIRR_VERIFY_KEY="own-key")
+    assert cfg.self_hosted_verify is True
+    ok("a URL and a key together point at the deployment's own instance")
+
+    # ---- screenshot reading is opt-in, on the reseller's own key -------------
+
+    print("\nScreenshot reading")
+
+    cfg = load_with()
+    assert cfg.receipt_scan_enabled is False
+    assert cfg.openrouter_model == ""
+    ok("off unless the reseller brings their own OpenRouter key")
+
+    cfg = load_with(OPENROUTER_API_KEY="sk-or-v1-test")
+    assert cfg.receipt_scan_enabled is True
+    ok("a key alone turns it on — the model has a sensible default")
+
+    cfg = load_with(OPENROUTER_API_KEY="sk-or-v1-test",
+                    OPENROUTER_MODEL="qwen/qwen-2.5-vl-7b-instruct")
+    assert cfg.openrouter_model == "qwen/qwen-2.5-vl-7b-instruct"
+    ok("and the model is overridable, so cost can be traded against accuracy")
 
     print(f"\n{len(checks)} checks passed.")
 

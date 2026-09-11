@@ -36,6 +36,7 @@ from .config import Config
 from .db import Db
 from .localpay import Refused, check as check_local_receipt
 from .localverify import ABYSSINIA, TELEBIRR, Verifier as LocalVerifier
+from .receiptscan import ReceiptScanner, ScanError
 from .localverify import VerifierError, detect as detect_local_reference
 from .localverify import normalise as normalise_local_reference
 from .money import fmt_etb, fmt_usdt, to_etb, to_usdt
@@ -52,11 +53,18 @@ db = Db(cfg.database_url)
 live = Settings(db)
 zentra = ZentraClient(cfg.zentra_api_key, base_url=cfg.zentra_api_base_url)
 
-# One client for LocalPaymentVerify, kept open across requests — cheap to
-# construct even when LOCAL_VERIFY_URL is blank, since Verifier only opens
-# an actual connection lazily and .configured says outright whether it can
-# be used at all.
-local_verifier = LocalVerifier(cfg.local_verify_url, cfg.local_verify_api_key)
+# Receipt verification, kept open across requests. Needs no configuration
+# of its own: it authenticates with the Zentra API key this bot already
+# has, and only points somewhere else if TELEBIRR_VERIFY_URL says so.
+local_verifier = LocalVerifier(
+    zentra_base_url=cfg.zentra_api_base_url, zentra_api_key=cfg.zentra_api_key,
+    self_host_url=cfg.telebirr_verify_url, self_host_key=cfg.telebirr_verify_key,
+)
+
+# Reading a reference off a screenshot. Off unless the reseller brought
+# their own OpenRouter key — see bot/receiptscan.py on why the cost, and
+# therefore the key, belongs to whoever incurs it.
+receipt_scanner = ReceiptScanner(cfg.openrouter_api_key, model=cfg.openrouter_model)
 
 bot = Bot(token=cfg.bot_token)
 dp = Dispatcher()
@@ -311,10 +319,14 @@ def abyssinia_rail_live() -> bool:
 
 def telebirr_verify_live() -> bool:
     """Whether a submitted Telebirr reference gets checked automatically,
-    as opposed to simply waiting for an admin. Needs the dashboard's own
-    switch AND a working LocalPaymentVerify instance — a provider outage
-    should fall back to manual review without an admin having to notice
-    and flip anything."""
+    as opposed to simply waiting for an admin.
+
+    True out of the box: verification runs through Zentra on the API key
+    this bot already has, so `configured` is satisfied by simply having a
+    Zentra key. Turning the dashboard switch off drops the rail back to
+    manual review — which is also what happens on its own if verification
+    is unreachable, without an admin having to notice and flip anything.
+    """
     return bool(live.get("telebirr_verify_enabled", False)) and local_verifier.configured
 
 
@@ -585,8 +597,63 @@ async def topup_abyssinia_amount(message: Message, state: FSMContext) -> None:
     await _local_topup_amount(message, state, "abyssinia")
 
 
+@dp.message(TopUp.local_reference, F.photo)
+async def topup_local_screenshot(message: Message, state: FSMContext) -> None:
+    """A screenshot instead of ten typed characters.
+
+    THE PICTURE IS NOT THE EVIDENCE. All that happens here is that a vision
+    model reads the reference off it (see bot/receiptscan.py); that
+    reference then goes down the ordinary path below, verified against the
+    provider exactly as though it had been typed. A screenshot alone can
+    never credit anything, which is what makes this safe to offer at all.
+    """
+    if not receipt_scanner.configured:
+        await message.answer(
+            "Send the reference as text, please — reading it from a "
+            "screenshot is not set up on this shop."
+        )
+        return
+
+    photo = message.photo[-1]  # the largest rendition Telegram kept
+    try:
+        buffer = await bot.download(photo.file_id)
+        image = buffer.read()
+    except Exception:  # noqa: BLE001
+        log.exception("Could not download a receipt screenshot.")
+        await message.answer(
+            "I could not open that image. Send the reference as text instead."
+        )
+        return
+
+    await message.answer("🔍 Reading your receipt…")
+    try:
+        # Telegram re-encodes every photo it stores as JPEG.
+        found = await receipt_scanner.read(image, "image/jpeg")
+    except ScanError as exc:
+        # Every failure has the same safe answer: type it instead. The
+        # customer is never stuck, and nothing has been credited.
+        log.info("Receipt scan failed: %s", exc)
+        await message.answer(f"{exc}")
+        return
+
+    await _handle_local_reference(message, state, found["reference"], None)
+
+
 @dp.message(TopUp.local_reference)
 async def topup_local_reference(message: Message, state: FSMContext) -> None:
+    parts = (message.text or "").split()
+    reference = parts[0].strip() if parts else ""
+    suffix = parts[1].strip() if len(parts) > 1 else None
+    await _handle_local_reference(message, state, reference, suffix)
+
+
+async def _handle_local_reference(
+    message: Message, state: FSMContext, reference: str, suffix: str | None,
+) -> None:
+    """Everything that happens once a reference exists, however it arrived —
+    typed by the customer or read off their screenshot. One path, so the
+    screenshot route cannot accidentally skip a check the typed route makes.
+    """
     data = await state.get_data()
     deposit_id = data.get("deposit_id")
     method = data.get("method")
@@ -596,9 +663,6 @@ async def topup_local_reference(message: Message, state: FSMContext) -> None:
         await message.answer("That request is no longer open. Start a new top-up from /start.")
         return
 
-    parts = (message.text or "").split()
-    reference = parts[0].strip() if parts else ""
-    suffix = parts[1].strip() if len(parts) > 1 else None
     expected_provider = _LOCAL_RAIL[method][0]
 
     if detect_local_reference(reference) != expected_provider:
@@ -779,14 +843,13 @@ async def main() -> None:
     # reference is verified on demand, the moment a customer submits one —
     # so there is nothing to start here beyond logging what will happen
     # when they do.
-    if local_verifier.configured:
-        log.info("LocalPaymentVerify configured at %s — Telebirr/Abyssinia "
-                 "receipts verify automatically when their own switch is on.",
-                 cfg.local_verify_url)
+    log.info("Telebirr/Abyssinia receipts verify through %s.", local_verifier.describe)
+    if receipt_scanner.configured:
+        log.info("Receipt screenshots are read by %s (your OpenRouter key).",
+                 receipt_scanner.model)
     else:
-        log.info("LOCAL_VERIFY_URL/LOCAL_VERIFY_API_KEY not set — Telebirr/"
-                 "Abyssinia top-ups, if enabled, are reviewed by hand in "
-                 "the dashboard.")
+        log.info("OPENROUTER_API_KEY not set — customers type the reference "
+                 "instead of sending a screenshot.")
 
     try:
         await dp.start_polling(bot)
@@ -804,6 +867,7 @@ async def main() -> None:
         if _binance_client is not None:
             await _binance_client.aclose()
         await local_verifier.aclose()
+        await receipt_scanner.aclose()
         await zentra.aclose()
         await db.close()
 

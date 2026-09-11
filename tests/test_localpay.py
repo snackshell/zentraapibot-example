@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
-from bot.localpay import Refused, check
+from bot.localpay import Refused, check, tail_matches
 
 
 @dataclass
@@ -114,6 +114,49 @@ def main() -> None:
         "ABCD123456", telebirr_answer(creditedPartyAccountNo="251912345678"), deposit(), cfg)
     assert receipt.receiver_account == "251912345678"
     ok("a receiver account written with a country code still matches the configured number")
+
+    # ---- masked accounts: the normal case on Telebirr ----------------------------
+
+    print("\nA masked receiver account, which is what Telebirr actually returns")
+
+    masked_cfg = FakeConfig(telebirr_number="0996720207")
+
+    # Telebirr redacts the middle: "2519****0207". Before this was handled,
+    # same_account() saw the asterisks, refused to guess, and EVERY genuine
+    # receipt on the rail was rejected. It has to be accepted — but only
+    # with the account name corroborating the four visible digits.
+    receipt = check("ABCD123456",
+                    telebirr_answer(creditedPartyAccountNo="2519****0207"),
+                    deposit(), masked_cfg)
+    assert receipt.credit == Decimal("200.00")
+    ok("a masked account whose visible digits AND name agree is credited")
+
+    refused(lambda: check(
+        "ABCD123456",
+        telebirr_answer(creditedPartyAccountNo="2519****0207",
+                        creditedPartyName="Somebody Else"),
+        deposit(), masked_cfg))
+    ok("the same masked account with a different name is refused — four digits "
+       "collide once in ten thousand, so the name is doing real work")
+
+    refused(lambda: check(
+        "ABCD123456", telebirr_answer(creditedPartyAccountNo="2519****9999"),
+        deposit(), masked_cfg))
+    ok("a masked account whose visible digits differ is refused")
+
+    # With no configured name there is nothing to corroborate against, so
+    # accepting four digits alone would be accepting a coin flip. Refused as
+    # the operator's problem, not the customer's.
+    refused(lambda: check(
+        "ABCD123456", telebirr_answer(creditedPartyAccountNo="2519****0207"),
+        deposit(), FakeConfig(telebirr_number="0996720207", telebirr_name="")),
+        operator=True)
+    ok("a masked account with NO configured name is refused as a misconfiguration")
+
+    # The collision this is all defending against, stated as a fact:
+    assert tail_matches("0911110207", "2519****0207") is True
+    ok("(and a stranger's account sharing four digits DOES pass the tail test "
+       "alone — which is exactly why it never stands alone)")
 
     # ---- the amount must be real ------------------------------------------------
 

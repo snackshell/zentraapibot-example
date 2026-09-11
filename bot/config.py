@@ -90,11 +90,11 @@ class Config:
     binance_api_secret: str
     binance_api_base: str
 
-    # ---- payment rails: Telebirr / Bank of Abyssinia (manual + verified) ---
-    # Verified means LocalPaymentVerify confirms the receipt automatically;
-    # see docs/GUIDE.md §12. Without it these rails still work — an admin
-    # approves each one by hand in the dashboard, which is where every
-    # reseller should start.
+    # ---- payment rails: Telebirr / Bank of Abyssinia -----------------------
+    # Receipts are verified against the provider automatically, through
+    # Zentra — no URL, no extra key, nothing to host. See docs/GUIDE.md §12.
+    # Verification failing or being turned off never loses a payment: the
+    # request lands in the dashboard for an admin to approve by hand.
     #
     # The receiving account is infrastructure, the same reasoning as
     # BSC_PAYMENT_ADDRESS and BINANCE_UID: it is who gets paid, not a
@@ -105,8 +105,22 @@ class Config:
     telebirr_name: str
     abyssinia_account: str
     abyssinia_name: str
-    local_verify_url: str
-    local_verify_api_key: str
+
+    # OPTIONAL, AND BLANK IS THE RIGHT ANSWER FOR ALMOST EVERYONE. Telebirr's
+    # receipt lookup only answers Ethiopian IP addresses, so verification
+    # runs through Zentra — authenticated with the ZENTRA_API_KEY above, so
+    # there is nothing extra to configure and no second key to manage. Fill
+    # these two in only to point at your OWN LocalPaymentVerify instance
+    # instead; see bot/localverify.py for the whole picture.
+    telebirr_verify_url: str
+    telebirr_verify_key: str
+
+    # OPTIONAL. Lets a customer send a screenshot instead of typing the
+    # reference. Billed to you per image, which is exactly why it is your
+    # key and not Zentra's — and the reading is never evidence, only a way
+    # to avoid typing (see bot/receiptscan.py).
+    openrouter_api_key: str
+    openrouter_model: str
 
     @property
     def bsc_rpc_enabled(self) -> bool:
@@ -127,8 +141,17 @@ class Config:
         return bool(self.binance_uid and self.binance_api_key and self.binance_api_secret)
 
     @property
-    def local_verify_enabled(self) -> bool:
-        return bool(self.local_verify_url and self.local_verify_api_key)
+    def self_hosted_verify(self) -> bool:
+        """Whether this deployment points at its own verification service.
+        Both halves are required: a URL with no key would be an open
+        endpoint, and silently falling back to Zentra when somebody MEANT
+        to self-host would send receipts somewhere they did not intend."""
+        return bool(self.telebirr_verify_url and self.telebirr_verify_key)
+
+    @property
+    def receipt_scan_enabled(self) -> bool:
+        """Whether a customer may send a screenshot instead of typing."""
+        return bool(self.openrouter_api_key)
 
     @property
     def telebirr_configured(self) -> bool:
@@ -174,8 +197,10 @@ class Config:
             telebirr_name=_str("TELEBIRR_NAME"),
             abyssinia_account=_str("ABYSSINIA_ACCOUNT"),
             abyssinia_name=_str("ABYSSINIA_NAME"),
-            local_verify_url=_str("LOCAL_VERIFY_URL"),
-            local_verify_api_key=_str("LOCAL_VERIFY_API_KEY"),
+            telebirr_verify_url=_str("TELEBIRR_VERIFY_URL"),
+            telebirr_verify_key=_str("TELEBIRR_VERIFY_KEY"),
+            openrouter_api_key=_str("OPENROUTER_API_KEY"),
+            openrouter_model=_str("OPENROUTER_MODEL"),
         )
 
     def is_admin(self, telegram_id: int) -> bool:

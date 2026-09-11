@@ -169,43 +169,70 @@ this app makes.
 
 ### Telebirr / Bank of Abyssinia top-ups
 
-**Manual by default.** With nothing more than a receiving account
-configured, both rails work exactly like "Credit by hand" always has: a
-customer sends a receipt reference, it waits in the dashboard's **Local
-Payments** page, and an admin credits or rejects it. Automatic
-verification is an upgrade on top of that, not a requirement to start.
+**Verified automatically, with nothing to host and no extra key.** Receipts
+are checked against the provider itself through Zentra, authenticated with
+the same `ZENTRA_API_KEY` this bot already uses to buy products.
+
+Why it works that way: Telebirr's receipt lookup only answers **Ethiopian IP
+addresses**. A bot on a VPS in Frankfurt cannot ask Telebirr anything, no
+matter how it is written — so Zentra runs that lookup from inside Ethiopia
+for you. Bank of Abyssinia has no such restriction.
 
 ```bash
 psql "$DATABASE_URL" -f supabase/migrations/0005_local_payments.sql
 ```
 
-1. Set `TELEBIRR_NUMBER`/`TELEBIRR_NAME` and/or `ABYSSINIA_ACCOUNT`/
-   `ABYSSINIA_NAME` in `.env`, then restart the bot. A rail with no account
-   set is not offered at all — see `bot/config.py`'s
-   `telebirr_configured`/`abyssinia_configured`.
+1. Set `TELEBIRR_NUMBER` and `TELEBIRR_NAME`, and/or `ABYSSINIA_ACCOUNT` and
+   `ABYSSINIA_NAME`, in `.env`, then restart the bot. That is the entire
+   setup. A rail with no account configured is not offered at all — see
+   `bot/config.py`'s `telebirr_configured`.
 2. Turn the rail(s) on: flip "Telebirr top-ups" / "Bank of Abyssinia
    top-ups" to Yes on the dashboard's Settings page, or
    `UPDATE settings SET value = 'yes' WHERE key = 'telebirr_enabled';`
    directly (and the same for `abyssinia_enabled`).
 3. Check `usdt_to_etb` on the Settings page is close to the real rate — it
-   is what converts a birr receipt into the USDT this wallet actually
-   holds, and only ever affects that conversion, never product pricing.
+   is what converts a birr receipt into the USDT this wallet actually holds,
+   and only ever affects that conversion, never product pricing.
 
-**To add automatic verification**, run a
+**Set the account NAME, not just the number.** Telebirr redacts the middle
+of the receiver's account on a receipt (`2519****0207`), leaving four digits
+— which collide once in ten thousand. The account name is what turns those
+four digits into a real match, so a receipt with no name to check against is
+refused rather than guessed at.
+
+**Three ways a payment gets confirmed**, and the bottom one always works:
+
+| | needs | when it is used |
+|---|---|---|
+| Verified automatically | nothing but your Zentra key | the default |
+| Customer sends a screenshot | your own `OPENROUTER_API_KEY` | convenience — the reference is read off the image, then verified normally |
+| An admin approves by hand | nothing, ever | verification off or unreachable, or a receipt that needs a human |
+
+Nothing is ever lost to a failure: if verification is unreachable, the
+receipt lands in the dashboard's **Local Payments** queue instead of telling
+a paying customer "no".
+
+**Reading receipts from screenshots** is optional and off by default. Set
+`OPENROUTER_API_KEY` (and optionally `OPENROUTER_MODEL`) and a customer can
+send a photo instead of typing ten characters. It is your key because the
+calls are billed per image to whoever makes them. **A screenshot is never
+proof of payment** — the model reads only the reference, and everything else
+it claims to see is discarded, because a picture can be edited in a minute
+and a provider's own record cannot.
+
+**To run verification yourself instead**, set `TELEBIRR_VERIFY_URL` and
+`TELEBIRR_VERIFY_KEY` to your own
 [LocalPaymentVerify](https://github.com/snackshell/localpaymentverify)
-instance (typically on the same box, loopback-only — it holds provider
-credentials this bot never sees), set `LOCAL_VERIFY_URL` and
-`LOCAL_VERIFY_API_KEY` in `.env`, and leave `telebirr_verify_enabled` /
-`abyssinia_verify_enabled` at their shipped default (Yes) on the Settings
-page. Turn either off — or simply don't run the verifier — to keep that
-one rail on manual review while everything else stays automatic.
+instance and Zentra is not involved. Worth doing if you already have an
+Ethiopian server, want lower latency, or would rather not depend on someone
+else's uptime. Both values are required together: a URL with no key would be
+an open endpoint.
 
-`docs/GUIDE.md` §12 covers the full design: why this rail matches by
-*reference* rather than amount, the receiver-account check that is the
-whole difference between a real payment and a stranger's genuine receipt
-pasted into your bot, and how a submitted reference reaches exactly the
-same credit path — and the same exactly-once guarantee — as every other
-rail.
+`docs/GUIDE.md` §12 covers the full design — why this rail matches by
+*reference* rather than amount, the receiver check that is the whole
+difference between a real payment and a stranger's genuine receipt pasted
+into your bot, and how a submitted reference reaches exactly the same credit
+path, with the same exactly-once guarantee, as every other rail.
 
 ## Architecture
 
@@ -218,8 +245,11 @@ bot/
                   watcher.py polls and credits
   binance_pay.py  Binance Pay — reads the operator's own account,
                   no merchant integration
-  localverify.py  the LocalPaymentVerify client — fetches a Telebirr/
-                  Abyssinia receipt, decides nothing about it
+  localverify.py  fetches a Telebirr/Abyssinia receipt — through Zentra by
+                  default (Telebirr needs an Ethiopian IP), or your own
+                  instance; decides nothing about what it finds
+  receiptscan.py  reads a reference off a screenshot on your own OpenRouter
+                  key — and throws away everything else it saw
   localpay.py     every rule a fetched receipt has to pass before
                   it becomes money — reference, receiver, amount, freshness
   settings.py     the runtime overlay: markup and rail toggles, editable without a restart
@@ -341,6 +371,7 @@ python -m tests.test_topup_flow
 python -m tests.test_local_deposits
 python -m tests.test_localverify
 python -m tests.test_localpay
+python -m tests.test_receiptscan
 python -m tests.test_lint
 ```
 

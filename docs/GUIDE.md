@@ -377,7 +377,7 @@ inside the Next.js runtime — which is exactly why the pure logic lives in
 tests directly. See the README's "The dashboard's own tests" for the exact
 commands.
 
-## 12. Telebirr and Bank of Abyssinia — manual by default, verified by choice
+## 12. Telebirr and Bank of Abyssinia — verified for you, nothing to host
 
 Both rails answer the same question every payment rail in this project
 answers — "did this specific customer's money actually arrive?" — but they
@@ -394,25 +394,50 @@ free to simply be whatever the customer actually sent (see `localpay.py`'s
 `Receipt.credit` for why the SETTLED figure, not the total the payer was
 charged, is what gets credited).
 
-**MANUAL BY DEFAULT, AND THAT IS NOT A LESSER MODE.** With nothing but a
-receiving account configured, a submitted reference simply waits — in
-`deposits`, with `status='awaiting'` and `reference` set — for an admin to
-resolve from the dashboard's Local Payments page. This is not a fallback
-bolted on for when something else fails; it is the whole rail, running
-exactly the way ZentraShopBot itself started before LocalPaymentVerify
-existed, and it is where every reseller using this starter should begin.
+**TELEBIRR CANNOT BE VERIFIED FROM OUTSIDE ETHIOPIA.** This is the fact the
+whole design follows from. Telebirr's receipt lookup answers Ethiopian IP
+addresses and refuses everyone else, so a bot on a VPS in Frankfurt, Dubai
+or Ohio cannot ask Telebirr anything, however the code is written. Nothing
+in this starter can fix that — but Zentra already runs that lookup from
+inside Ethiopia, so verification goes through Zentra instead.
 
-**AUTOMATIC VERIFICATION IS AN UPGRADE, NOT A REQUIREMENT.**
-[LocalPaymentVerify](https://github.com/snackshell/localpaymentverify) is a
-small service you run yourself — typically on the same box's loopback —
-that holds the actual provider credentials this bot never sees. It answers
-exactly one question, "what does the provider say about this reference?",
-through `bot/localverify.py`'s `Verifier.verify()`. Every decision about
-whether that answer is enough to credit a wallet is made afterwards, in
-`bot/localpay.py`'s `check()` — the same separation of "fetch" from
-"decide" ZentraShopBot's own `verifier.py`/`localpay.py` split uses, kept
-for the same reason: a verifier that both fetches and adjudicates is a
-verifier whose bugs are indistinguishable from its policy.
+**WHICH MEANS THERE IS NOTHING TO CONFIGURE.** No verifier URL, no second
+API key. The request is authenticated with the SAME Zentra API key this bot
+uses to buy products, so there is one credential, in one place, revocable in
+one action. Set your Telebirr number and name and the rail verifies.
+
+Bank of Abyssinia has no geographic restriction. It travels the same path
+for consistency, but a self-hoster can run that half anywhere in the world;
+Telebirr genuinely cannot move.
+
+**YOU CAN STILL RUN YOUR OWN.** `TELEBIRR_VERIFY_URL` and
+`TELEBIRR_VERIFY_KEY` point this bot at your own
+[LocalPaymentVerify](https://github.com/snackshell/localpaymentverify)
+instance, in its own `x-api-key` shape, and Zentra is not involved at all.
+Worth doing if you already have an Ethiopian server, want lower latency, or
+would rather not depend on someone else's uptime. Both are required
+together: a URL with no key would be an open endpoint, and silently falling
+back to Zentra when you MEANT to self-host would send receipts somewhere you
+did not intend. `bot/localverify.py`'s two modes differ only in where they
+point and how they authenticate — they answer in the same shape, so
+switching is two lines of `.env` and nothing else.
+
+**MANUAL REVIEW IS ALWAYS THE FLOOR, AND THAT IS NOT A LESSER MODE.** With
+verification turned off — or simply unreachable — a submitted reference
+waits in `deposits`, with `status='awaiting'` and `reference` set, for an
+admin to resolve from the dashboard's Local Payments page. This matters more
+than it looks: it means no failure anywhere in the chain can lose a
+customer's money. A rejected key, a quota run dry, an Ethiopian outage —
+each one ends with a receipt in a queue and a human, never with "your
+payment does not exist" shown to somebody holding a valid receipt.
+
+**FETCHING AND DECIDING ARE SEPARATE.** `bot/localverify.py` answers exactly
+one question — "what does the provider say about this reference?" — and
+decides nothing. Every decision about whether that answer is enough to
+credit a wallet is made afterwards in `bot/localpay.py`'s `check()`. This is
+the same split ZentraShopBot's own `verifier.py`/`localpay.py` uses, for the
+same reason: a verifier that both fetches and adjudicates is a verifier
+whose bugs are indistinguishable from its policy.
 
 ### The checks a fetched receipt has to pass
 
@@ -439,18 +464,53 @@ problem — unless every one of these holds:
   Africa Time (+03:00, no daylight saving) is assumed when a stamp carries
   none — see `PROVIDER_TZ`'s own comment for the reasoning.
 
-**SCOPE REDUCTION FROM ZENTRASHOPBOT'S OWN CHECK**, stated plainly the way
-every reduction in this project is: no masked-account handling. The real
-shop's relay sometimes redacts the middle of an account number and
-corroborates with the account holder's name in that case; this starter
-assumes a full, unmasked account number, which is what LocalPaymentVerify
-returns today. If that ever changes, `same_account()` refuses every
-receipt rather than accept a stranger's — the safe direction to fail in —
-and this is where to look. Also absent: reading a reference off a receipt
-photograph (`verify-image` in ZentraShopBot's own verifier). A customer
-types the ten characters instead; that is optical convenience, not a
-payment-safety requirement, the same reasoning behind `chain/rpc.py`
-polling one endpoint instead of running a failover pool.
+### Masked accounts, and why the account NAME is required
+
+Telebirr does not show a receipt's full receiver account. It redacts the
+middle — `2519****0207` — leaving four digits. Four digits collide once in
+ten thousand, so on their own they are corroboration, not proof: somebody
+else's Telebirr account ending 0207 would match just as well as yours.
+
+So a masked account is accepted only when **both** signals agree: the
+visible digits AND the account name. That is why `TELEBIRR_NAME` is part of
+the setup rather than decoration — with no name configured there is nothing
+to corroborate against, and `check()` refuses the receipt as a
+misconfiguration (`operator=True`) rather than accepting a coin flip.
+
+`same_account()` handles the unmasked case and deliberately returns False
+for anything containing a `*`: its contract is "these are certainly the same
+account", and a redacted number cannot answer that. `tail_matches()` answers
+the narrower question, and every caller is required to pair it with the
+name. `tests/test_localpay.py` pins all four outcomes down — matching digits
+with a matching name credits, matching digits with a WRONG name is refused,
+differing digits are refused, and no configured name is refused as an
+operator problem.
+
+### Screenshots: convenience, never evidence
+
+A customer can send a photo of their receipt instead of typing ten
+characters, if the reseller set `OPENROUTER_API_KEY`. The key is theirs
+because vision calls are billed per image to whoever makes them, and a
+shared key would mean one shop's customers spending another shop's money.
+
+`bot/receiptscan.py` extracts exactly two things — the provider and the
+reference — and **throws away everything else the model read**. The amount,
+the receiver, the date, a `"verified": true` the model volunteered: all
+discarded, deliberately. That reference then goes down the ordinary path,
+verified against the provider and checked by `check()` exactly as though it
+had been typed.
+
+This is the rule that makes the feature safe to offer at all. A screenshot
+can be edited convincingly in a minute; a provider's own record cannot. If
+any field the model produced were allowed to influence a credit, a forged
+image would buy real goods — so `_extract()` returns a two-key dictionary
+and the test suite asserts that a chatty model's extra fields never survive
+it. The model's claimed provider is not trusted either: the shape is
+re-derived from the reference itself, and a disagreement means the reading is
+not good enough to act on.
+
+Every failure here has the same safe answer — type it instead — so a
+customer is never stuck, and nothing is credited on a picture alone.
 
 ### The database side: one function, every rail
 
@@ -483,12 +543,15 @@ whether to credit it.
    configured is not offered.
 2. The dashboard settings `telebirr_enabled`/`abyssinia_enabled` — offers
    the rail to customers, independent of whether verification is on.
-3. Optionally, a LocalPaymentVerify instance plus `LOCAL_VERIFY_URL`/
-   `LOCAL_VERIFY_API_KEY`, and `telebirr_verify_enabled`/
-   `abyssinia_verify_enabled` (Yes by default) — turns automatic
-   verification on for that rail specifically, so a provider outage drops
-   one rail back to manual review without hiding it or touching the other.
-4. `usdt_to_etb` — the only place ETB ever touches this shop's own
+3. **Nothing at all for verification** — it is on by default, on the Zentra
+   API key you already have. Optionally: `TELEBIRR_VERIFY_URL`/
+   `TELEBIRR_VERIFY_KEY` to run your own instance instead, and
+   `OPENROUTER_API_KEY` to let customers send screenshots.
+4. The dashboard settings `telebirr_verify_enabled`/
+   `abyssinia_verify_enabled` (Yes by default) decide whether each rail
+   verifies automatically, per rail — so one rail can drop back to manual
+   review without hiding it from customers or touching the other.
+5. `usdt_to_etb` — the only place ETB ever touches this shop's own
    currency: it converts a birr receipt into the USDT the wallet holds,
    and never affects product pricing, which stays in USDT throughout.
 

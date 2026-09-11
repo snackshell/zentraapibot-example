@@ -25,7 +25,7 @@ os.environ["DATABASE_URL"] = test_database_url()
 from bot import bot as botmod  # noqa: E402
 from bot.bot import (  # noqa: E402
     TopUp, topup_abyssinia_start, topup_binance_amount, topup_binance_start,
-    topup_local_reference, topup_telebirr_amount, topup_telebirr_start,
+    topup_local_reference, topup_local_screenshot, topup_telebirr_amount, topup_telebirr_start,
     topup_usdt_amount, topup_usdt_start, wallet,
 )
 
@@ -256,9 +256,14 @@ async def main() -> None:
     assert call9b.alerts and "not turned on" in call9b.alerts[0]
     ok("Abyssinia refuses independently, with no account configured for it either")
 
-    print("\nTelebirr, live — manual review (no verifier configured)")
+    print("\nTelebirr, live — manual review (verification switched off)")
 
     await db.write_setting("telebirr_enabled", "yes", updated_by=None)
+    # Verification needs NO configuration now — a Zentra API key is enough,
+    # so it is ON by default. This section is about the manual path, so turn
+    # it off explicitly; leaving it on would make a real network call and
+    # test something else entirely.
+    await db.write_setting("telebirr_verify_enabled", "no", updated_by=None)
     await botmod.live.refresh()
     botmod.cfg = botmod.cfg.__class__(
         **{**botmod.cfg.__dict__, "telebirr_number": "0912345678",
@@ -284,7 +289,7 @@ async def main() -> None:
     await topup_local_reference(ref_msg, tb_state)
     assert tb_state.state is None
     assert "Received" in ref_msg.sent[-1]
-    ok("without a verifier configured, a submitted reference is acknowledged and left for review")
+    ok("with verification off, a submitted reference is acknowledged and left for review")
 
     tb_user = await db.user_by_telegram_id(5009)
     pending = [d for d in await db.user_deposits(tb_user["id"]) if d["method"] == "telebirr"]
@@ -293,6 +298,16 @@ async def main() -> None:
     assert pending[0]["reference"] == "ABCD123456"
     ok("and the deposit itself is exactly what the dashboard's Local Payments page shows: "
        "awaiting, with the reference attached, nothing credited")
+
+    # The headline of this whole design: a reseller who configured NOTHING
+    # but their Zentra key still gets automatic verification.
+    assert botmod.local_verifier.configured is True
+    assert botmod.local_verifier.self_hosted is False
+    await db.write_setting("telebirr_verify_enabled", "yes", updated_by=None)
+    await botmod.live.refresh()
+    assert botmod.telebirr_verify_live() is True
+    ok("with no verifier URL and no verifier key set at all, verification is still "
+       "live — the Zentra API key is the only credential involved")
 
     print("\nTelebirr, live — automatic verification")
 
@@ -344,6 +359,93 @@ async def main() -> None:
     assert balance_5009 == Decimal("3.13"), balance_5009
     ok("the credited figure is the receipt's own ETB amount, converted at usdt_to_etb")
 
+    # ---- the screenshot route ------------------------------------------------
+    #
+    # A photo is a shortcut past TYPING, never a shortcut past CHECKING. The
+    # scanner only reads the reference; verification and every localpay rule
+    # still run, which is what these two cases prove.
+
+    print("\nA screenshot instead of typing")
+
+    class FakeScanner:
+        def __init__(self, reference=None, error=None):
+            self.reference = reference
+            self.error = error
+            self.configured = True
+            self.model = "fake/vision"
+            self.calls = 0
+
+        async def read(self, image, mime="image/jpeg"):
+            self.calls += 1
+            if self.error is not None:
+                raise self.error
+            return {"provider": "telebirr", "reference": self.reference}
+
+    class FakeBot:
+        """Stands in for aiogram's Bot — only download() is reached here."""
+        async def download(self, file_id):
+            import io
+            return io.BytesIO(b"pretend-jpeg-bytes")
+
+    class FakePhotoMessage(FakeMessage):
+        def __init__(self, chat_id):
+            super().__init__(chat_id)
+            self.photo = [type("P", (), {"file_id": "big-one"})()]
+
+    real_bot = botmod.bot
+    botmod.bot = FakeBot()
+    try:
+        # A screenshot whose reference IS genuine gets credited, exactly as
+        # if typed — same verifier, same rules.
+        botmod.local_verifier = FakeVerifier(answer={
+            "provider": "telebirr",
+            "data": {**matching_answer["data"], "receiptNo": "PHOTO00001"},
+        })
+        botmod.receipt_scanner = FakeScanner(reference="PHOTO00001")
+        shot_state = FakeState()
+        await topup_telebirr_start(FakeCall(5009), shot_state)
+        await topup_telebirr_amount(FakeMessage(5009, text="500"), shot_state)
+        before = await db.balance(tb_user["id"])
+        shot = FakePhotoMessage(5009)
+        await topup_local_screenshot(shot, shot_state)
+        assert "Top-up received" in shot.sent[-1], shot.sent
+        assert await db.balance(tb_user["id"]) > before
+        ok("a screenshot of a genuine receipt credits the wallet — the read reference "
+           "goes through the same verification the typed one does")
+
+        # And the decisive one: a screenshot whose receipt was paid to
+        # SOMEBODY ELSE is refused, even though the image "looked right" and
+        # the model read it perfectly. The picture was never the evidence.
+        botmod.local_verifier = FakeVerifier(answer={
+            "provider": "telebirr",
+            "data": {**matching_answer["data"], "receiptNo": "PHOTO00002",
+                     "creditedPartyAccountNo": "0999999999",
+                     "creditedPartyName": "Someone Else"},
+        })
+        botmod.receipt_scanner = FakeScanner(reference="PHOTO00002")
+        bad_state = FakeState()
+        await topup_telebirr_start(FakeCall(5009), bad_state)
+        await topup_telebirr_amount(FakeMessage(5009, text="500"), bad_state)
+        held = await db.balance(tb_user["id"])
+        bad_shot = FakePhotoMessage(5009)
+        await topup_local_screenshot(bad_shot, bad_state)
+        assert "different account" in bad_shot.sent[-1], bad_shot.sent
+        assert await db.balance(tb_user["id"]) == held
+        ok("a screenshot read perfectly but paid to a different account credits "
+           "NOTHING — the image is not the evidence, the provider is")
+
+        # With no OpenRouter key, the feature is simply absent.
+        botmod.receipt_scanner = type("Off", (), {"configured": False})()
+        off_state = FakeState()
+        await topup_telebirr_start(FakeCall(5009), off_state)
+        await topup_telebirr_amount(FakeMessage(5009, text="500"), off_state)
+        off_shot = FakePhotoMessage(5009)
+        await topup_local_screenshot(off_shot, off_state)
+        assert "as text" in off_shot.sent[-1]
+        ok("with no OpenRouter key, a photo is politely redirected to typing")
+    finally:
+        botmod.bot = real_bot
+
     print("\nTelebirr, automatic verification — a receipt paid to someone else")
 
     botmod.local_verifier = FakeVerifier(answer={
@@ -352,6 +454,10 @@ async def main() -> None:
                  "creditedPartyAccountNo": "0999999999", "creditedPartyName": "Someone Else"},
     })
     refused_state = FakeState()
+    # Re-read rather than reusing an earlier snapshot: other sections above
+    # have legitimately credited this wallet since then, and what this case
+    # asserts is that THIS refusal moves nothing.
+    balance_before_refusal = await db.balance(tb_user["id"])
     await topup_telebirr_start(FakeCall(5009), refused_state)
     await topup_telebirr_amount(FakeMessage(5009, text="500"), refused_state)
     refused_msg = FakeMessage(5009, text="WRONG00001")
@@ -362,7 +468,8 @@ async def main() -> None:
        "and the customer is told why in the same message")
 
     unchanged_balance = await db.balance(tb_user["id"])
-    assert unchanged_balance == balance_5009, "a refused receipt must not move the balance"
+    assert unchanged_balance == balance_before_refusal, \
+        "a refused receipt must not move the balance"
     ok("and the wallet balance has not moved")
 
     await db.close()

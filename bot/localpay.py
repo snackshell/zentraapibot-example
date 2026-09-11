@@ -16,15 +16,14 @@ customer hands us the provider's own reference, which identifies the
 payment by itself — so the amount is not asked to MATCH what was
 requested, only to be real. What arrived is what gets credited.
 
-SCOPE REDUCTION FROM ZENTRASHOPBOT'S OWN CHECK: no masked-account handling.
-The real bot's relay sometimes redacts the middle of an account number
-("2519****0207") and corroborates with the account holder's name in that
-case; this starter assumes the configured receiving account is compared
-against a full, unmasked account number, which is what LocalPaymentVerify
-itself returns today. If your own verifier instance ever starts masking
-account numbers, `same_account()` below will refuse every receipt rather
-than accept a stranger's — the safe direction to be wrong in — and this
-docstring is where to come look.
+MASKED ACCOUNT NUMBERS ARE THE NORMAL CASE, NOT AN EDGE CASE. Telebirr's
+lookup redacts the middle of the receiver's account — "2519****0207" — so
+only four digits survive. Four digits collide once in ten thousand, which
+is fine as corroboration and useless as proof, so a masked account is
+accepted only when the visible digits AND the account name both agree.
+That is why TELEBIRR_NAME is not decoration: with no name configured there
+is nothing to corroborate against, and a masked receipt is refused as a
+misconfiguration rather than guessed at.
 """
 
 from __future__ import annotations
@@ -93,18 +92,45 @@ def digits(value) -> str:
     return re.sub(r"\D", "", str(value or ""))
 
 
+def is_masked(value) -> bool:
+    """Whether the provider redacted the middle of this account number."""
+    return "*" in str(value or "") or "\u2022" in str(value or "")
+
+
 def same_account(configured: str, reported: str) -> bool:
     """Whether two renderings of an account number are the same account,
     compared on the last nine digits — enough to distinguish accounts
-    while tolerating a country code. Both sides must actually have digits:
-    two empty strings are not a match, they are a missing check."""
+    while tolerating a country code (0912345678 and 251912345678 are one
+    number written two ways). Both sides must actually have digits: two
+    empty strings are not a match, they are a missing check.
+
+    A MASKED NUMBER IS NOT DECIDABLE HERE and says so by returning False.
+    Only four digits survive redaction, and this function's contract is
+    "these are certainly the same account" — check() handles the masked
+    case separately, with a name to corroborate against.
+    """
     ours, theirs = digits(configured), digits(reported)
     if not ours or not theirs:
+        return False
+    if is_masked(reported):
         return False
     tail = min(len(ours), len(theirs), 9)
     if tail < 6:
         return False
     return ours[-tail:] == theirs[-tail:]
+
+
+def tail_matches(configured: str, reported: str, length: int = 4) -> bool:
+    """Do the last `length` visible digits agree?
+
+    ONLY MEANINGFUL ALONGSIDE ANOTHER SIGNAL. A four-digit tail collides
+    once in ten thousand — fine as corroboration, useless as proof. Every
+    caller is required to pair it with the account name.
+    """
+    ours, theirs = digits(configured), digits(reported)
+    if len(ours) < length or len(theirs) < length:
+        return False
+    return ours[-length:] == theirs[-length:]
 
 
 def same_name(configured: str, reported: str) -> bool:
@@ -233,7 +259,34 @@ def check(submitted: str, answer: dict, deposit, cfg) -> Receipt:
             "That receipt does not say who was paid, so we cannot confirm "
             "it reached us. Contact support with your receipt.", support=True)
 
-    account_ok = same_account(expected_account, receipt.receiver_account)
+    # The name is CORROBORATION, never a substitute on its own: a matching
+    # name against a mismatched account is somebody else's account at the
+    # same bank. Against a MASKED account it becomes load bearing, because
+    # four visible digits are not an identity.
+    name_ok = bool(expected_name) and same_name(expected_name, receipt.receiver_name)
+
+    if is_masked(receipt.receiver_account):
+        # Telebirr redacts the middle: "2519****0207". Refusing outright
+        # would refuse every genuine payment on the rail; accepting four
+        # digits alone would let a one-in-ten-thousand collision through.
+        # So BOTH have to agree — the visible digits and the account name.
+        if not expected_name:
+            log.error(
+                "%s receipt %s has a masked account and no configured name "
+                "to check it against", provider, mask(submitted))
+            raise Refused(
+                "This payment method is not fully set up yet. Support has "
+                "been told — please use another method.", operator=True)
+
+        account_ok = tail_matches(expected_account, receipt.receiver_account)
+        if account_ok and not name_ok:
+            log.warning(
+                "%s receipt %s: masked account matched but the name did not",
+                provider, mask(submitted))
+        account_ok = account_ok and name_ok
+    else:
+        account_ok = same_account(expected_account, receipt.receiver_account)
+
     if not account_ok:
         log.warning("%s receipt %s was paid to %s, not to %s",
                     provider, mask(submitted),
@@ -244,10 +297,10 @@ def check(submitted: str, answer: dict, deposit, cfg) -> Receipt:
             "credited here. Check you sent it to the number shown on the "
             "payment screen.")
 
-    if expected_name and receipt.receiver_name and not same_name(expected_name, receipt.receiver_name):
-        # The account matched and the name did not — a joint account, a
-        # renamed merchant, or a misread receipt. Worth a person seeing,
-        # not worth refusing on its own.
+    if expected_name and receipt.receiver_name and not name_ok:
+        # An unmasked account matched and the name did not — a joint
+        # account, a renamed merchant, or a misread receipt. Worth a person
+        # seeing, not worth refusing on its own.
         log.warning("%s receipt %s matched the account but not the name",
                     provider, mask(submitted))
 
