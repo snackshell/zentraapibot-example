@@ -115,6 +115,44 @@ def main() -> None:
     assert receipt.receiver_account == "251912345678"
     ok("a receiver account written with a country code still matches the configured number")
 
+    # ---- the shape a REAL relay actually returns ---------------------------------
+    #
+    # Every fixture above uses tidy values ("202.00"). Production does not:
+    # a live Telebirr lookup returns amounts as "200 Birr" — the currency
+    # word included — and dates as DD-MM-YYYY in Ethiopian local time with no
+    # timezone marker at all. This case is copied from a real response, with
+    # only the identity changed, so that a future tidy-up of money() or
+    # DATE_FORMATS cannot quietly break production while the tests stay green.
+
+    print("\nThe exact shape a live Telebirr lookup returns")
+
+    live_cfg = FakeConfig(telebirr_number="0996720207",
+                          telebirr_name="Abebe Kebede Tesfaye")
+    live_answer = {"provider": "telebirr", "data": {
+        "receiptNo": "ABCD123456",
+        "transactionStatus": "Completed",
+        "totalPaidAmount": "200 Birr",      # note: not "200.00"
+        "settledAmount": "198 Birr",        # Telebirr's 2 birr fee
+        "creditedPartyName": "Abebe Kebede Tesfaye",
+        "creditedPartyAccountNo": "2519****0207",   # masked, as it always is
+        "paymentDate": datetime.now(timezone.utc).astimezone(
+            timezone(timedelta(hours=3))).strftime("%d-%m-%Y %H:%M:%S"),
+    }}
+
+    receipt = check("ABCD123456", live_answer, deposit(amount_expected="200"), live_cfg)
+    assert receipt.credit == Decimal("198"), receipt.credit
+    ok("amounts written as '200 Birr' parse, and the SETTLED 198 is credited — "
+       "the 2 birr fee is Telebirr's and never reaches the shop")
+
+    # The date carries no timezone. Read as UTC it would sit 3 hours in the
+    # FUTURE and be refused as forged; read as East Africa Time it is now.
+    stamp = receipt.paid_at_utc
+    assert stamp is not None, "a real Telebirr date failed to parse"
+    drift = abs((datetime.now(timezone.utc) - stamp).total_seconds())
+    assert drift < 120, f"a receipt dated now parsed as {stamp} ({drift}s away)"
+    ok("a DD-MM-YYYY stamp with no timezone is read as East Africa Time, "
+       "not UTC — otherwise every fresh receipt looks 3 hours in the future")
+
     # ---- masked accounts: the normal case on Telebirr ----------------------------
 
     print("\nA masked receiver account, which is what Telebirr actually returns")
